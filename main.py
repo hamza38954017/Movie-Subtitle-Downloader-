@@ -1,192 +1,290 @@
 import os
-import re
-import json
-from urllib.parse import urljoin, quote, unquote, urlparse, urlunparse
-from flask import Flask, request, render_template_string, Response
-from curl_cffi import requests as cffi_requests
+import requests
+from urllib.parse import quote
+from flask import Flask, request, jsonify, render_template_string, Response
 
 app = Flask(__name__)
 
-BASE_DOMAIN = "https://xhamster45.desi"
-SPOOF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# ==========================================
+# CREDENTIALS & CONFIGURATION
+# ==========================================
+# We recommend setting these in Render's "Environment" tab later
+API_KEY = os.environ.get("OPENSUBTITLES_API_KEY", "jnMaFtWskYAcAHv42xUovuPcanowNys5")
+USERNAME = os.environ.get("OPENSUBTITLES_USERNAME", "crazydev") 
+PASSWORD = os.environ.get("OPENSUBTITLES_PASSWORD", "hamza1") 
+USER_AGENT = os.environ.get("OPENSUBTITLES_USER_AGENT", "MySubDownloader v1.0") 
+BASE_URL = "https://api.opensubtitles.com/api/v1"
 
-# The Frontend UI
+# ==========================================
+# BACKEND API ROUTES
+# ==========================================
+
+@app.route('/api/fetch_subtitle', methods=['POST'])
+def fetch_subtitle():
+    movie = request.form.get('movie')
+    if not movie:
+        return jsonify({'error': 'Please enter a movie name.'}), 400
+
+    # Step 1: Login
+    login_res = requests.post(
+        f"{BASE_URL}/login", 
+        json={"username": USERNAME, "password": PASSWORD}, 
+        headers={"Api-Key": API_KEY, "User-Agent": USER_AGENT, "Content-Type": "application/json"}
+    )
+    
+    if login_res.status_code != 200:
+        return jsonify({'error': 'Authentication failed. Check credentials.'}), 401
+    
+    token = login_res.json().get('token')
+
+    # Step 2: Search for the movie
+    search_res = requests.get(
+        f"{BASE_URL}/subtitles", 
+        params={"query": movie, "languages": "en"}, 
+        headers={"Api-Key": API_KEY, "Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+    )
+    
+    if search_res.status_code != 200:
+        return jsonify({'error': 'Failed to search OpenSubtitles database.'}), 500
+        
+    data = search_res.json().get('data', [])
+    if not data:
+        return jsonify({'error': f'No English subtitles found for "{movie}".'}), 404
+
+    file_id = data[0]['attributes']['files'][0]['file_id']
+    file_name = data[0]['attributes']['files'][0]['file_name']
+
+    # Step 3: Get Download Link
+    dl_res = requests.post(
+        f"{BASE_URL}/download", 
+        json={"file_id": file_id}, 
+        headers={
+            "Api-Key": API_KEY, 
+            "Authorization": f"Bearer {token}", 
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+    )
+    
+    if dl_res.status_code != 200:
+        return jsonify({'error': 'Failed to retrieve the download link from the server.'}), 500
+
+    download_link = dl_res.json().get('link')
+    
+    # Change extension to .txt
+    txt_file_name = file_name.rsplit('.', 1)[0] + '.txt'
+
+    # Return the URL to our own proxy route
+    proxy_url = f"/api/serve?url={quote(download_link)}&name={quote(txt_file_name)}"
+    return jsonify({'success': True, 'download_url': proxy_url})
+
+
+@app.route('/api/serve', methods=['GET'])
+def serve_file():
+    """Fetches the file from OpenSubtitles and serves it as a clean .txt file."""
+    url = request.args.get('url')
+    name = request.args.get('name')
+    
+    if not url or not name:
+        return "Missing parameters", 400
+
+    # Fetch the file passing the User-Agent to prevent CDN blocking
+    res = requests.get(url, headers={"User-Agent": USER_AGENT})
+    
+    if res.status_code != 200:
+        return f"Failed to fetch file from OpenSubtitles. Status: {res.status_code}", 500
+
+    # Force the browser to download it as a text file
+    return Response(
+        res.content,
+        mimetype="text/plain",
+        headers={"Content-Disposition": f'attachment;filename="{name}"'}
+    )
+
+# ==========================================
+# FRONTEND UI
+# ==========================================
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SS-Style Video Fetcher</title>
+    <title>Movie Subtitle Downloader</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f0f0f; color: #fff; text-align: center; padding: 40px 20px; margin: 0; }
-        h1 { color: #ff4757; margin-bottom: 10px; }
-        .search-container { margin-bottom: 40px; display: flex; justify-content: center; gap: 10px; }
-        input[type="text"] { width: 60%; max-width: 600px; padding: 12px 20px; font-size: 16px; border-radius: 8px; border: 1px solid #333; background: #222; color: white; outline: none; }
-        button { padding: 12px 24px; font-size: 16px; background: #ff4757; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #ff6b81; }
-        .video-wrapper { max-width: 900px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.8); border-radius: 8px; overflow: hidden; background: #000; margin-bottom: 20px;}
-        .error { color: #ff6b81; font-weight: bold; margin-top: 20px; }
-        .temp-url-box { background: #222; padding: 15px; border-radius: 8px; font-family: monospace; color: #2ecc71; word-break: break-all; margin-bottom: 20px; }
+        body { font-family: 'Inter', sans-serif; }
+        .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
     </style>
 </head>
-<body>
-    <h1>🚀 SS-Style Fetcher</h1>
-    <p style="color: #888;">Generates a proxy-stream link just like ssyoutube.</p>
+<body class="gradient-bg min-h-screen flex flex-col justify-between text-gray-800">
 
-    <form class="search-container" method="POST" action="/">
-        <input type="text" name="url" placeholder="Paste full video page URL here..." required>
-        <button type="submit">Generate Link</button>
-    </form>
+    <main class="flex-grow flex items-center justify-center p-6">
+        <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-8">
+            
+            <div class="text-center mb-8">
+                <div class="bg-indigo-100 text-indigo-600 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl">
+                    <i class="fa-solid fa-closed-captioning"></i>
+                </div>
+                <h1 class="text-3xl font-bold text-gray-900">Movie Subtitle Downloader</h1>
+                <p class="text-gray-500 mt-2">Find and download subtitles instantly as .txt files.</p>
+            </div>
 
-    {% if error %}<p class="error">⚠️ {{ error }}</p>{% endif %}
+            <form id="downloadForm" class="space-y-5">
+                <div>
+                    <label for="movie" class="block text-sm font-medium text-gray-700 mb-1">Movie Name</label>
+                    <div class="relative">
+                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <i class="fa-solid fa-film text-gray-400"></i>
+                        </div>
+                        <input type="text" id="movie" name="movie" required placeholder="e.g., Bheeshma" 
+                            class="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm transition shadow-sm">
+                    </div>
+                </div>
 
-    {% if temp_url %}
-        <h3 style="margin-bottom: 20px;">{{ title }}</h3>
-        
-        <p>Temporary Streaming URL (Hosted on your server):</p>
-        <div class="temp-url-box">{{ request.host_url[:-1] }}{{ temp_url }}</div>
-        
-        <div class="video-wrapper">
-            <video controls preload="metadata" width="100%" height="auto" autoplay>
-                <source src="{{ temp_url }}" type="video/mp4">
-                Your browser does not support the video tag.
-            </video>
+                <button type="submit" id="submitBtn" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+                    <i class="fa-solid fa-download mr-2 mt-0.5"></i> Download Subtitle
+                </button>
+            </form>
+
+            <div id="statusContainer" class="hidden mt-6">
+                <div class="flex justify-between text-xs text-gray-500 mb-1">
+                    <span id="statusText">Searching...</span>
+                    <span id="progressText">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div id="progressBar" class="bg-indigo-600 h-2 rounded-full transition-all duration-500 ease-out" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <div id="errorMessage" class="hidden mt-4 p-3 bg-red-50 text-red-700 rounded-lg text-sm border border-red-200"></div>
+            
+            <div id="successMessage" class="hidden mt-4 p-3 bg-green-50 text-green-700 rounded-lg text-sm border border-green-200">
+                <i class="fa-solid fa-check-circle mr-1"></i> Download starting! Your .txt file is ready.
+            </div>
+
+            <div class="mt-10 border-t border-gray-100 pt-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">Frequently Asked Questions</h3>
+                <div class="space-y-4">
+                    <details class="group bg-gray-50 rounded-lg">
+                        <summary class="flex justify-between items-center font-medium cursor-pointer list-none p-4">
+                            <span>What format are the subtitles?</span>
+                            <span class="transition group-open:rotate-180">
+                                <i class="fa-solid fa-chevron-down text-gray-400 text-sm"></i>
+                            </span>
+                        </summary>
+                        <div class="text-gray-600 mt-2 px-4 pb-4 text-sm">
+                            Subtitles are originally fetched as .srt formats but this tool automatically converts and saves them directly to your device as a plain text (.txt) file for easy reading.
+                        </div>
+                    </details>
+                    <details class="group bg-gray-50 rounded-lg">
+                        <summary class="flex justify-between items-center font-medium cursor-pointer list-none p-4">
+                            <span>Are the subtitles free?</span>
+                            <span class="transition group-open:rotate-180">
+                                <i class="fa-solid fa-chevron-down text-gray-400 text-sm"></i>
+                            </span>
+                        </summary>
+                        <div class="text-gray-600 mt-2 px-4 pb-4 text-sm">
+                            Yes! We utilize the OpenSubtitles API which provides a massive, community-driven database of free subtitles.
+                        </div>
+                    </details>
+                </div>
+            </div>
+
         </div>
-    {% endif %}
+    </main>
+
+    <footer class="bg-white/10 backdrop-blur-md py-4 text-center text-white text-sm">
+        <p>Developer- Dr. Hamza</p>
+    </footer>
+
+    <script>
+        document.getElementById('downloadForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const movieName = document.getElementById('movie').value;
+            const submitBtn = document.getElementById('submitBtn');
+            const statusContainer = document.getElementById('statusContainer');
+            const progressBar = document.getElementById('progressBar');
+            const statusText = document.getElementById('statusText');
+            const progressText = document.getElementById('progressText');
+            const errorMessage = document.getElementById('errorMessage');
+            const successMessage = document.getElementById('successMessage');
+
+            submitBtn.disabled = true;
+            submitBtn.classList.add('opacity-70', 'cursor-not-allowed');
+            errorMessage.classList.add('hidden');
+            successMessage.classList.add('hidden');
+            statusContainer.classList.remove('hidden');
+            
+            progressBar.style.width = '10%';
+            progressText.innerText = '10%';
+            statusText.innerText = 'Authenticating with API...';
+
+            let progressInterval = setInterval(() => {
+                let currentWidth = parseInt(progressBar.style.width);
+                if (currentWidth < 85) {
+                    progressBar.style.width = (currentWidth + 5) + '%';
+                    progressText.innerText = (currentWidth + 5) + '%';
+                    if(currentWidth > 30) statusText.innerText = 'Searching database...';
+                    if(currentWidth > 60) statusText.innerText = 'Generating .txt file...';
+                }
+            }, 600);
+
+            const formData = new FormData();
+            formData.append('movie', movieName);
+
+            fetch('/api/fetch_subtitle', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                clearInterval(progressInterval);
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                progressBar.style.width = '100%';
+                progressText.innerText = '100%';
+                statusText.innerText = 'Complete!';
+                successMessage.classList.remove('hidden');
+
+                setTimeout(() => {
+                    window.location.href = data.download_url;
+                    resetUI();
+                }, 1000);
+
+            })
+            .catch(error => {
+                clearInterval(progressInterval);
+                statusContainer.classList.add('hidden');
+                errorMessage.innerText = error.message || 'Network error occurred.';
+                errorMessage.classList.remove('hidden');
+                resetUI();
+            });
+
+            function resetUI() {
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('opacity-70', 'cursor-not-allowed');
+                setTimeout(() => {
+                    progressBar.style.width = '0%';
+                }, 2000);
+            }
+        });
+    </script>
 </body>
 </html>
 """
 
-@app.route("/", methods=["GET", "POST"])
+@app.route('/')
 def index():
-    temp_url = None
-    title = "Video Player"
-    error = None
+    return render_template_string(HTML_TEMPLATE)
 
-    if request.method == "POST":
-        page_url = request.form.get("url")
-        try:
-            # 1. Bypass Cloudflare to get the raw page
-            resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=15)
-            html = resp.text
-
-            title_match = re.search(r'<title>(.*?)</title>', html)
-            if title_match: title = title_match.group(1).replace(" | xHamster", "").strip()
-
-            data = {}
-            json_match = re.search(r'window\.initials\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
-            if json_match:
-                try: data = json.loads(json_match.group(1))
-                except: pass
-            
-            if not data:
-                script_matches = re.findall(r'<script[^>]*>(.*?videoModel.*?)</script>', html, re.DOTALL | re.IGNORECASE)
-                for script in script_matches:
-                    try:
-                        start, end = script.find('{'), script.rfind('}') + 1
-                        data = json.loads(script[start:end])
-                        break
-                    except: continue
-
-            raw_mp4_url = None
-            
-            # 2. Prioritize Direct MP4 extraction (This is what SSYouTube does)
-            if data:
-                sources = data.get("videoModel", {}).get("sources", {})
-                if "mp4" in sources:
-                    mp4_data = sources["mp4"]
-                    if isinstance(mp4_data, dict):
-                        if "url" in mp4_data: raw_mp4_url = mp4_data["url"]
-                        else:
-                            for key, val in mp4_data.items():
-                                if isinstance(val, dict) and "url" in val:
-                                    raw_mp4_url = val["url"]
-                                    break
-                    elif isinstance(mp4_data, str): raw_mp4_url = mp4_data
-                
-                # Fallback to HLS if MP4 isn't available
-                if not raw_mp4_url and "hls" in sources: 
-                    raw_mp4_url = sources["hls"].get("url")
-
-            # 3. Generate the Temporary URL pointing to our Python Proxy
-            if raw_mp4_url:
-                temp_url = f"/stream?target={quote(raw_mp4_url)}"
-            else:
-                error = "Could not extract video source. Might be a premium-only stream."
-
-        except Exception as e:
-            error = f"Error scraping: {str(e)}"
-
-    return render_template_string(HTML_TEMPLATE, temp_url=temp_url, title=title, error=error)
-
-@app.route("/stream")
-def stream_proxy():
-    """
-    The SSYouTube Proxy Engine.
-    Intercepts the target URL, injects headers, and critically: handles Range requests!
-    """
-    target_url = request.args.get("target")
-    if not target_url: return "No target", 400
-    target_url = unquote(target_url)
-
-    # Prepare spoofing headers for the CDN
-    proxy_headers = {
-        "Referer": BASE_DOMAIN,
-        "User-Agent": SPOOF_USER_AGENT
-    }
-
-    # CRITICAL: Forward the exact byte-range the browser is asking for
-    client_range = request.headers.get("Range")
-    if client_range:
-        proxy_headers["Range"] = client_range
-
-    try:
-        # Request the video from the CDN with the range header
-        req = cffi_requests.get(target_url, headers=proxy_headers, stream=True, impersonate="chrome120", timeout=15)
-    except Exception as e:
-        return str(e), 500
-
-    # Read the response headers from the CDN
-    status_code = req.status_code
-    content_type = req.headers.get("Content-Type", "video/mp4")
-    content_length = req.headers.get("Content-Length")
-    content_range = req.headers.get("Content-Range")
-
-    # If it's an m3u8 playlist, we must fall back to the old HLS logic
-    if ".m3u8" in target_url or "mpegurl" in content_type.lower():
-        content = req.text
-        def replace_uri(match):
-            orig = match.group(1)
-            abs_url = urljoin(target_url, orig)
-            return f'URI="/stream?target={quote(abs_url)}"'
-        content = re.sub(r'URI="([^"]+)"', replace_uri, content)
-        
-        new_m3u8 = []
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("#") or not line: new_m3u8.append(line)
-            else:
-                abs_url = urljoin(target_url, line)
-                new_m3u8.append(f"/stream?target={quote(abs_url)}")
-        return Response("\n".join(new_m3u8), content_type="application/vnd.apple.mpegurl")
-
-    # The Generator that pipes the video bytes back to the browser
-    def generate():
-        for chunk in req.iter_content(chunk_size=65536): 
-            if chunk: yield chunk
-
-    # Create the Flask Response
-    resp = Response(generate(), status=status_code, content_type=content_type)
-    
-    # Pass the CDN's exact size and range markers back to the browser
-    if content_length: resp.headers["Content-Length"] = content_length
-    if content_range: resp.headers["Content-Range"] = content_range
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-
-    return resp
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    # This runs the app locally if you test it on your computer
+    app.run(debug=True)
